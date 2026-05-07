@@ -3,6 +3,7 @@ import joblib
 import json
 import numpy as np
 import pandas as pd
+from keras.models import load_model
 
 from src.features.feature_engineering import create_features
 from src.models.lstm_model import forecast_lstm, prepare_state_data
@@ -130,17 +131,21 @@ def predict(state: str):
     # -----------------------------
     elif best_model == "LSTM":
 
-        model, scaler = joblib.load(f"models/saved_models/lstm/{state}.pkl")
+    
 
-        data = prepare_state_data(df, state)
+     model = load_model(f"models/lstm_{state}.keras")
 
-        forecast = forecast_lstm(model, scaler, data)
+     scaler = joblib.load(f"models/scaler_{state}.pkl")
 
-        return {
-            "state": state,
-            "model": best_model,
-            "forecast_8_weeks": forecast
-        }
+     data = prepare_state_data(df, state)
+
+     forecast = forecast_lstm(model, scaler, data)
+
+     return {
+         "state": state,
+         "model": best_model,
+         "forecast_8_weeks": forecast
+     }
 
 
     else:
