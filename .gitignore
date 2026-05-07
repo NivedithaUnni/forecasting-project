@@ -1,0 +1,6 @@
+venv/
+__pycache__/
+*.pyc
+models/*.pkl
+models/*.keras
+data/raw/
