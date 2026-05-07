@@ -3,6 +3,8 @@ import joblib
 import json
 import numpy as np
 import pandas as pd
+import os
+
 from keras.models import load_model
 
 from src.features.feature_engineering import create_features
@@ -10,143 +12,273 @@ from src.models.lstm_model import forecast_lstm, prepare_state_data
 
 router = APIRouter()
 
-# -----------------------------
-# LOAD ONCE (IMPORTANT FIX)
-# -----------------------------
-with open("models/final_model_selection.json", "r") as f:
-    MODEL_SELECTION = json.load(f)
+# ---------------------------------------------------
+# LOAD MODEL SELECTION
+# ---------------------------------------------------
+try:
+    with open("models/final_model_selection.json", "r") as f:
+        MODEL_SELECTION = json.load(f)
 
-df = pd.read_csv("data/processed/cleaned_data.csv")
-df["date"] = pd.to_datetime(df["date"])
+except Exception as e:
+    print("❌ Error loading model selection:", e)
+    MODEL_SELECTION = {}
+
+# ---------------------------------------------------
+# LOAD DATASET
+# ---------------------------------------------------
+try:
+    df = pd.read_csv("data/processed/cleaned_data.csv")
+
+    df["date"] = pd.to_datetime(df["date"])
+
+    # Clean state names
+    df["state"] = df["state"].astype(str).str.strip()
+
+except Exception as e:
+    print("❌ Error loading dataset:", e)
+    df = pd.DataFrame()
 
 
-# -----------------------------
+# ---------------------------------------------------
 # HEALTH CHECK
-# -----------------------------
+# ---------------------------------------------------
 @router.get("/health")
 def health():
     return {"status": "OK"}
 
 
-# -----------------------------
-# CORE PREDICTOR
-# -----------------------------
+# ---------------------------------------------------
+# PREDICT ROUTE
+# ---------------------------------------------------
 @router.get("/predict")
 def predict(state: str):
 
-    state = state.strip()
+    try:
 
-    if state not in MODEL_SELECTION:
-        raise HTTPException(status_code=404, detail="State not found")
+        # ---------------------------------------------------
+        # CLEAN INPUT
+        # ---------------------------------------------------
+        state = state.strip()
 
-    best_model = MODEL_SELECTION[state]["best_model"]
+        print(f"\n🚀 Prediction request for: {state}")
 
-    state_df = df[df["state"] == state].copy()
+        # ---------------------------------------------------
+        # CHECK STATE
+        # ---------------------------------------------------
+        if state not in MODEL_SELECTION:
 
-    if state_df.empty:
-        raise HTTPException(status_code=404, detail="No data for state")
+            print("❌ State missing in MODEL_SELECTION")
 
-    print(f"🚀 State: {state} | Model: {best_model}")
+            raise HTTPException(
+                status_code=404,
+                detail=f"State '{state}' not found"
+            )
 
+        # ---------------------------------------------------
+        # GET BEST MODEL
+        # ---------------------------------------------------
+        best_model = MODEL_SELECTION[state]["best_model"]
 
-    # -----------------------------
-    # XGBOOST
-    # -----------------------------
-    if best_model == "XGBoost":
+        print(f"✅ Best Model: {best_model}")
 
-        model = joblib.load(f"models/saved_models/xgb/{state}.pkl")
+        # ---------------------------------------------------
+        # FILTER STATE DATA
+        # ---------------------------------------------------
+        state_df = df[df["state"] == state].copy()
 
-        df_feat = create_features(state_df).dropna()
+        if state_df.empty:
 
-        if df_feat.empty:
-            raise HTTPException(status_code=500, detail="Not enough feature data")
+            print("❌ No data found for state")
 
-        input_row = df_feat.iloc[-1].copy()
+            raise HTTPException(
+                status_code=404,
+                detail=f"No data for state '{state}'"
+            )
 
-        features = [
-            "lag_1", "lag_7", "lag_30",
-            "roll_mean_7", "roll_std_7",
-            "dayofweek", "month", "is_holiday"
-        ]
+        # ===================================================
+        # XGBOOST
+        # ===================================================
+        if best_model == "XGBoost":
 
-        forecast = []
+            model_path = f"models/saved_models/xgb/{state}.pkl"
 
-        for _ in range(8):
+            if not os.path.exists(model_path):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Model file missing: {model_path}"
+                )
 
-            X_input = np.array([input_row[features].values])
-            pred = model.predict(X_input)[0]
+            model = joblib.load(model_path)
 
-            forecast.append(float(pred))
+            # Create features
+            df_feat = create_features(state_df).dropna()
 
-            # 🔥 recursive update (IMPORTANT)
-            input_row["lag_30"] = input_row["lag_7"]
-            input_row["lag_7"] = input_row["lag_1"]
-            input_row["lag_1"] = pred
+            if df_feat.empty:
+                raise HTTPException(
+                    status_code=500,
+                    detail="Feature engineering returned empty dataframe"
+                )
 
-            input_row["roll_mean_7"] = np.mean(forecast[-7:])
-            input_row["roll_std_7"] = np.std(forecast[-7:]) if len(forecast) > 1 else 0
+            input_row = df_feat.iloc[-1].copy()
 
-        return {
-            "state": state,
-            "model": best_model,
-            "forecast_8_weeks": forecast
-        }
+            features = [
+                "lag_1",
+                "lag_7",
+                "lag_30",
+                "roll_mean_7",
+                "roll_std_7",
+                "dayofweek",
+                "month",
+                "is_holiday"
+            ]
 
+            forecast = []
 
-    # -----------------------------
-    # PROPHET
-    # -----------------------------
-    elif best_model == "Prophet":
+            for _ in range(8):
 
-        model = joblib.load(f"models/saved_models/prophet/{state}.pkl")
+                X_input = np.array(
+                    [input_row[features].values]
+                )
 
-        future = model.make_future_dataframe(periods=8)
-        forecast_df = model.predict(future)
+                pred = model.predict(X_input)[0]
 
-        return {
-            "state": state,
-            "model": best_model,
-            "forecast_8_weeks": forecast_df["yhat"].tail(8).tolist()
-        }
+                pred = float(pred)
 
+                forecast.append(pred)
 
-    # -----------------------------
-    # ARIMA
-    # -----------------------------
-    elif best_model == "ARIMA":
+                # Recursive update
+                input_row["lag_30"] = input_row["lag_7"]
+                input_row["lag_7"] = input_row["lag_1"]
+                input_row["lag_1"] = pred
 
-        model = joblib.load(f"models/saved_models/arima/{state}.pkl")
+                input_row["roll_mean_7"] = np.mean(
+                    forecast[-7:]
+                )
 
-        forecast = model.forecast(steps=8)
+                input_row["roll_std_7"] = np.std(
+                    forecast[-7:]
+                ) if len(forecast) > 1 else 0
 
-        return {
-            "state": state,
-            "model": best_model,
-            "forecast_8_weeks": forecast.tolist()
-        }
+            return {
+                "state": state,
+                "model": best_model,
+                "forecast_8_weeks": forecast
+            }
 
+        # ===================================================
+        # PROPHET
+        # ===================================================
+        elif best_model == "Prophet":
 
-    # -----------------------------
-    # LSTM
-    # -----------------------------
-    elif best_model == "LSTM":
+            model_path = f"models/saved_models/prophet/{state}.pkl"
 
-    
+            if not os.path.exists(model_path):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Model file missing: {model_path}"
+                )
 
-     model = load_model(f"models/lstm_{state}.keras")
+            model = joblib.load(model_path)
 
-     scaler = joblib.load(f"models/scaler_{state}.pkl")
+            future = model.make_future_dataframe(
+                periods=8
+            )
 
-     data = prepare_state_data(df, state)
+            forecast_df = model.predict(future)
 
-     forecast = forecast_lstm(model, scaler, data)
+            forecast = forecast_df["yhat"].tail(8).tolist()
 
-     return {
-         "state": state,
-         "model": best_model,
-         "forecast_8_weeks": forecast
-     }
+            return {
+                "state": state,
+                "model": best_model,
+                "forecast_8_weeks": forecast
+            }
 
+        # ===================================================
+        # ARIMA
+        # ===================================================
+        elif best_model == "ARIMA":
 
-    else:
-        raise HTTPException(status_code=500, detail="Unsupported model")
+            model_path = f"models/saved_models/arima/{state}.pkl"
+
+            if not os.path.exists(model_path):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Model file missing: {model_path}"
+                )
+
+            model = joblib.load(model_path)
+
+            forecast = model.forecast(steps=8)
+
+            return {
+                "state": state,
+                "model": best_model,
+                "forecast_8_weeks": forecast.tolist()
+            }
+
+        # ===================================================
+        # LSTM
+        # ===================================================
+        elif best_model == "LSTM":
+
+            model_path = f"models/saved_models/lstm/{state}.keras"
+
+            scaler_path = f"models/saved_models/lstm/{state}_scaler.pkl"
+
+            if not os.path.exists(model_path):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"LSTM model missing: {model_path}"
+                )
+
+            if not os.path.exists(scaler_path):
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Scaler missing: {scaler_path}"
+                )
+
+            # Load model
+            model = load_model(model_path)
+
+            # Load scaler
+            scaler = joblib.load(scaler_path)
+
+            # Prepare data
+            data = prepare_state_data(df, state)
+
+            # Forecast
+            forecast = forecast_lstm(
+                model,
+                scaler,
+                data
+            )
+
+            return {
+                "state": state,
+                "model": best_model,
+                "forecast_8_weeks": forecast
+            }
+
+        # ===================================================
+        # UNSUPPORTED MODEL
+        # ===================================================
+        else:
+
+            raise HTTPException(
+                status_code=500,
+                detail=f"Unsupported model '{best_model}'"
+            )
+
+    except HTTPException as e:
+        raise e
+
+    except Exception as e:
+
+        print("\n🔥 INTERNAL ERROR")
+        print(str(e))
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
